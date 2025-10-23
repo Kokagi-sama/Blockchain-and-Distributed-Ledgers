@@ -1,0 +1,208 @@
+% 1. DOCUMENT CLASS
+% Sets font size to 11pt (required) and paper size to A4.
+\documentclass[11pt, a4paper]{article}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{amsmath, amsfonts}
+\usepackage[colorlinks=true, linkcolor=blue, urlcolor=blue]{hyperref}
+
+\lstset{
+  basicstyle=\footnotesize\ttfamily,
+  keywordstyle=\color{blue},
+  stringstyle=\color{orange},
+  commentstyle=\color{green!70!black},
+  numbers=left,
+  numberstyle=\tiny,
+  breaklines=true,
+  backgroundcolor=\color{gray!10},
+  frame=single,
+  captionpos=b,
+  showstringspaces=false
+}
+
+\geometry{margin=1in}
+
+% --- 4. DOCUMENT BODY ---
+
+% Title Page Information
+% Remember: The PDF says to use your exam number, NOT your name.
+\title{BDL 2025 Smart Contract Coursework Report}
+\author{Exam Number: B299013} % <-- REPLACE WITH YOUR EXAM NUMBER
+\date{\today}
+
+\begin{document}
+
+\maketitle
+% \tableofcontents % Removed this line
+% \newpage % Removed this line
+
+\section{Detailed Contract Design Decisions}
+This section outlines the key design choices implemented in the Vickrey Auction smart contract (\texttt{B299013.sol}).
+
+\subsection{How are bids kept private during the bidding phase?}
+Bid privacy is achieved using a \textbf{commit-reveal scheme}, a standard technique to mitigate front-running. The auction proceeds in two distinct phases governed by timestamps:
+\begin{enumerate}
+    \item \textbf{Commit Phase (until \texttt{biddingEndTime}):} Bidders do not submit their actual bid amount. Instead, they submit a cryptographic commitment (a hash) of their bid amount combined with a secret nonce (a random, securely generated value). This is calculated off-chain as \texttt{keccak256(abi.encodePacked(\_bidAmount, \_nonce))}. They also send their maximum possible bid value (or higher) as a deposit (\texttt{msg.value}) during the \texttt{commitBid()} function call. The hash hides the true bid amount from other bidders and observers during this phase.
+    \item \textbf{Reveal Phase (between \texttt{biddingEndTime} and \texttt{revealEndTime}):} Bidders call the \texttt{revealBid()} function, submitting their original bid amount and nonce. The contract recalculates the hash using these revealed values \newline (\texttt{keccak256(abi.encodePacked(\_bidAmount, \_nonce))}) and verifies it against the commitment submitted earlier. Only if the hashes match is the bid considered valid.
+\end{enumerate}
+This ensures that bid values remain confidential until the bidding phase is closed, preventing participants from adjusting their bids based on others' revealed values during the bidding window.
+
+\subsection{How is the payment sent to the seller?}
+The contract employs the \textbf{pull-over-push payment pattern} (Lecture 04, Slide 12-14) for enhanced security and robustness. Instead of the contract automatically "pushing" funds to the seller upon finalization, the process is:
+\begin{enumerate}
+    \item \textbf{Finalisation (\texttt{finalisedAuction()}):} When the auction concludes, the contract calculates the winning price (the second-highest valid bid, or the reserve price if only one bid or the second bid is below reserve). This calculated amount is then credited to the seller's balance within a dedicated mapping: \texttt{mapping(address => uint256) public pendingWithdrawals}. The actual ETH is not transferred at this stage.
+    \item \textbf{Withdrawal (\texttt{withdrawFunds()}):} The seller (or any other user with a pending balance, like refunded bidders) must explicitly call the \texttt{withdrawFunds()} function. This function checks their balance in \texttt{pendingWithdrawals}, sets it to zero (following the Checks-Effects-Interactions pattern to prevent re-entrancy), and then transfers the ETH to their address (\texttt{msg.sender}).
+\end{enumerate}
+This pattern avoids potential issues associated with push payments, such as hitting gas limits if the recipient is a contract with a complex fallback function, or unexpected failures if the recipient rejects the payment, which could otherwise block the finalization process (DoS/Griefing, Lecture 04, Slide 11). It shifts the responsibility (and gas cost) of the final transfer to the recipient.
+
+\subsection{How is it guaranteed that a seller / bidder cannot cheat?}
+Several mechanisms prevent cheating:
+\begin{itemize}
+    \item \textbf{Shill Bidding Prevention:} The seller is explicitly prohibited from bidding on their own auction via the check \texttt{require(msg.sender != auction.seller)} within the \texttt{commitBid()} function. While a seller could technically use a separate address, this prevents direct bidding from the registered seller address.
+    \item \textbf{Commit-Reveal Scheme:} As described above, this prevents bidders from seeing others' bids during the bidding phase and adjusting their own bid accordingly. It also prevents bidders from changing their bid amount after committing; they can only reveal the amount corresponding to the hash they initially submitted.
+    \item \textbf{Single Bid Commitment:} The check \texttt{require(bids[\_auctionId][msg.sender]\newline.commitment == bytes32(0), "Bid has already been committed.")} in \texttt{commitBid()} ensures that each address can only submit one commitment per auction, preventing a bidder from submitting multiple hidden bids and revealing only the most advantageous one.
+    \item \textbf{NFT and Fund Escrow:} The contract acts as a neutral escrow. The NFT is transferred to the contract using \texttt{safeTransferFrom} when the auction starts (\texttt{startAuction()}), ensuring the seller cannot withdraw it during the auction. Bidder deposits (\texttt{msg.value}) are held by the contract until the auction is finalised. The \texttt{finalisedAuction()} function then handles the logic for transferring the NFT to the winner and making funds available for withdrawal (to the seller and refunded bidders) according to the auction rules. This prevents either party from absconding with both the NFT and the funds.
+    \item \textbf{Deposit Requirement:} Bidders must deposit an amount greater than or equal to their intended bid (\texttt{require(bid.deposit >= \_bidAmount)} in \texttt{revealBid()}). This ensures they have the funds to back their bid if they win.
+    \item \textbf{Re-entrancy Protection:} Withdrawal functions (\texttt{withdrawFunds()}, \texttt{claimLosingBid()}) implement the Checks-Effects-Interactions pattern by setting the user's balance \newline (\texttt{pendingWithdrawals} or \texttt{bid.deposit}) to zero before executing the external ETH transfer (\texttt{.call\{value: ...\}} or adding to \texttt{pendingWithdrawals}). This prevents re-entrancy attacks where a malicious contract could repeatedly call back into the withdraw function before the balance is updated (Lecture 04, Slide 21-27).
+\end{itemize}
+
+\subsection{How are ties settled?}
+Ties occur if multiple bidders reveal the exact same highest bid amount. The contract settles ties deterministically based on the \textbf{commit block number}. The logic within \texttt{revealBid()} checks:
+% Using verbatim environment for multi-line code display
+\begin{verbatim}
+else if (_bidAmount == auction.highestBid) {
+    if (bid.commitBlock < auction.highestBidCommitBlock) {
+        // Current bid wins the tie break
+        auction.secondHighestBid = auction.highestBid;
+        auction.highestBidder = payable(msg.sender);
+        auction.highestBidCommitBlock = bid.commitBlock;
+    } else {
+        // Old bid committed earlier or in the same block, 
+        // current bid is second highest
+        auction.secondHighestBid = _bidAmount;
+    }
+}
+\end{verbatim}
+This means if two bids have the same value, the bid that was included in an earlier block (\texttt{bid.commitBlock < auction.highestBidCommitBlock}) wins. \texttt{block.number} is chosen over \texttt{block.timestamp} because timestamps can be manipulated to some extent by miners, whereas block numbers are strictly sequential and harder to manipulate for tie-breaking purposes (Lecture 04, Slide 75-76).
+
+\subsection{Are bidders allowed to bid multiple times on the same item or not, and how is this handled?}
+No, bidders are \textbf{not allowed to bid multiple times} in the same auction using the same address. This is enforced by the \texttt{commitBid()} function with the check:
+\texttt{require(bids[\_auctionId][msg.sender].commitment == bytes32(0), "Bid has already been committed.")}.
+This line verifies that the \texttt{commitment} field for the calling address (\texttt{msg.sender}) in the specific auction (\texttt{\_auctionId}) is still its default zero value (\texttt{bytes32(0)}). If a commitment already exists (meaning the bidder has already called \texttt{commitBid()} for this auction), the requirement fails, and the transaction reverts, preventing a second commit.
+
+\subsection{What data type/structures do you use and why?}
+The contract utilizes several key data structures:
+\begin{itemize}
+    \item \textbf{\texttt{struct Auction} and \texttt{struct Bid}:} Structs are used to group related data logically. \texttt{Auction} bundles all information pertaining to a single auction (seller, NFT details, deadlines, status, winner info), while \texttt{Bid} groups data related to a specific bidder's participation in an auction (commitment hash, deposit, commit block, reveal status). This improves code readability and organization compared to managing individual variables for each property.
+    \item \textbf{\texttt{mapping(uint256 => Auction) public auctions}:} A mapping links a unique auction ID (\texttt{uint256 auctionCounter}) to its corresponding \texttt{Auction} struct. Mappings provide efficient O(1) lookup based on the key (the auction ID).
+    \item \textbf{\texttt{mapping(uint256 => mapping(address => Bid)) public bids}:} A nested mapping is used to store bid information. The outer key is the auction ID, and the inner key is the bidder's address. This structure efficiently retrieves a specific bidder's \texttt{Bid} struct for a given auction (e.g., \texttt{bids[auctionId][bidderAddress]}).
+    \item \textbf{\texttt{mapping(address => uint256) public pendingWithdrawals}:} This mapping stores the amount of ETH owed to each address (sellers or refunded bidders) as part of the pull payment pattern. It allows for efficient tracking and retrieval of withdrawable balances.
+    \item \textbf{\texttt{IERC721 public immutable nftContract}:} An immutable state variable stores the address of the NFT contract. Using \texttt{immutable} saves gas compared to a regular state variable because the value is set in the constructor and baked directly into the contract bytecode, rather than being stored in a storage slot. The \texttt{IERC721} interface type allows interaction with the standard NFT functions like \texttt{ownerOf} and \texttt{safeTransferFrom}.
+    \item \textbf{Basic Types:} Standard types like \texttt{address payable} (for ETH transfers), \texttt{uint256} (for amounts, IDs, timestamps, block numbers), \texttt{bytes32} (for hashes/commitments), and \texttt{bool} (for flags like \texttt{active}, \texttt{finalised}, \texttt{revealed}) are used for their respective purposes. Solidity \texttt{\^0.8.0} is used, which includes built-in checks for integer overflow/underflow (Lecture 04, Slide 97).
+\end{itemize}
+
+\subsection{Other Design Decisions}
+\begin{itemize}
+    \item \textbf{Events:} The contract emits events (\texttt{AuctionStarted}, \texttt{BidCommitted}, \texttt{BidRevealed}, \texttt{AuctionFinalised}, \texttt{FundsWithdrawn}) to log significant actions. This facilitates off-chain monitoring and indexing of contract activity.
+    \item \textbf{IERC721Receiver Implementation:} The contract inherits from \texttt{IERC721Receiver} and implements the \texttt{onERC721Received} function. This is necessary to allow the contract to securely receive the NFT via \texttt{safeTransferFrom} when an auction is started, acting as the escrow agent.
+    \item \textbf{Reserve Price:} The \texttt{reservePrice} allows the seller to set a minimum acceptable price. Bids below this value are ignored during winner determination in \texttt{revealBid()}. If no valid bids meet or exceed the reserve price, the NFT is returned to the seller during finalization.
+    \item \textbf{Timestamp-based Deadlines:} \texttt{block.timestamp} is used to define \texttt{biddingEndTime} and \texttt{revealEndTime}. While timestamps have some miner manipulability, they are generally considered acceptable for defining time periods in Solidity, unlike using them for critical randomness or tie-breaking logic.
+\end{itemize}
+
+
+\section{Gas Evaluation}
+(Provide a detailed gas evaluation. You can use a table here.)
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Function} & \textbf{Gas Cost (Approx.)} \\
+\midrule
+Contract Deployment & [Gas cost] \\
+\texttt{startAuction()} & [Gas cost] \\
+\texttt{commitBid()} & [Gas cost] \\
+\texttt{revealBid()} (losing bid) & [Gas cost] \\
+\texttt{revealBid()} (new highest bid) & [Gas cost] \\
+\texttt{finalisedAuction()} & [Gas cost] \\
+\texttt{claimLosingBid()} & [Gas cost] \\
+\texttt{withdrawFunds()} & [Gas cost] \\
+\bottomrule
+\end{tabular}
+\caption{Gas costs of primary contract interactions.}
+\label{tab:gas}
+\end{table}
+
+\subsection{Gas Fairness}
+(Discuss if some roles pay more gas. For example, \texttt{finalisedAuction} does a lot of work. Also, the first person to reveal a new highest bid pays slightly more gas than subsequent bidders because they write to more storage slots: \texttt{highestBid}, \texttt{highestBidder}, \texttt{secondHighestBid}, \texttt{highestBidCommitBlock}.)
+
+\subsection{Efficiency Techniques}
+(Mention any techniques you used to save gas, e.g., using \texttt{immutable} for \texttt{nftContract}, choosing appropriate data types, Solidity version 0.8+ optimizations.)
+
+
+\section{Potential Vulnerabilities and Hazards}
+\subsection{Re-entrancy}
+(Explain how your \texttt{withdrawFunds} and \texttt{claimLosingBid} functions prevent re-entrancy by following the Checks-Effects-Interactions pattern, specifically by setting \texttt{pendingWithdrawals[msg.sender] = 0} or \texttt{bid.deposit = 0} before the external ETH transfer (\texttt{.call\{value: ...\}} or adding to \texttt{pendingWithdrawals}). Reference Lecture 04, Slide 27-28.)
+% You can insert an image of your re-entrancy guard here
+
+\subsection{Shill Bidding}
+(Explain the \texttt{require(msg.sender != auction.seller)} check. Acknowledge the limitation that a seller could still use a different wallet address.)
+
+\subsection{Timestamp/Block Variable Manipulation}
+(Explain why \texttt{block.number} (\texttt{commitBlock}) was used for the tie-breaker instead of \texttt{block.timestamp}, as timestamps can be manipulated by miners (Lecture 04, Slide 75-76, 88). Acknowledge that \texttt{block.timestamp} is used for deadlines, which is a common practice but carries a minor risk if precise timing is critical.)
+
+\subsection{Integer Overflow/Underflow}
+(Mention that the contract uses \texttt{pragma solidity \^0.8.0;}, and Solidity versions 0.8.0 and above have built-in checks for arithmetic overflow and underflow, mitigating this risk without needing external libraries like SafeMath (Lecture 04, Slide 97).)
+
+
+\section{Design Tradeoffs and Choices}
+(This is a good place to discuss your tie-breaking rule. You chose "earlier commit block wins." Tradeoffs: Fairly deterministic, prevents reveal-phase gas wars. Downside: If two valuable bids are in the same block, the tie is arbitrary based on internal transaction ordering within the block, though still deterministic. Contrast with "first to reveal wins" - creates incentives for gas wars during reveal. Contrast with "random" tie-breaking - difficult/insecure to implement on-chain.)
+
+(Also, discuss the "pull-over-push" pattern: Tradeoff: Enhanced security (prevents re-entrancy in caller, avoids external call failures blocking execution) and potentially better gas fairness vs. poorer user experience (requires users to send one extra transaction (\texttt{withdrawFunds} or \texttt{claimLosingBid}) to retrieve their ETH).)
+
+
+\section{Analysis of Fellow Student's Contract}
+(Analyze your peer's contract here. Include their contract address.)
+
+\subsection{Security Analysis}
+(Did they prevent re-entrancy? Shill bidding? Did they use \texttt{block.timestamp} insecurely for randomness or tie-breaking? Did they handle integer overflow/underflow if using ^0.8.0? Did they correctly implement commit-reveal? Did they use pull-over-push?)
+
+\subsection{Efficiency and Fairness}
+(Is their gas usage reasonable compared to yours? Are there obvious gas optimizations missed? Is their tie-breaking rule fair? Who pays the gas for key operations like finalization or refunds?)
+
+\subsection{Discovered Vulnerabilities}
+(Detail any specific vulnerabilities found (e.g., re-entrancy possibility, insecure randomness, logic errors) and explain step-by-step how you would exploit them.)
+
+
+\section{On-chain Interaction Details}
+\subsection{My Deployed Contract Address (B299013)}
+\textbf{Address:} \href{https://sepolia.etherscan.io/address/[YOUR_CONTRACT_ADDRESS_HERE]}{[YOUR\_CONTRACT\_ADDRESS\_HERE]}
+
+\subsection{Peer's Deployed Contract Address}
+\textbf{Address:} \href{https://sepolia.etherscan.io/address/[PEER_CONTRACT_ADDRESS_HERE]}{[PEER\_CONTRACT\_ADDRESS\_HERE]}
+
+\subsection{My Transaction Hashes}
+(List your key transactions, e.g., starting an auction, bidding on your peer's auction.)
+\begin{itemize}
+    \item \textbf{Start Auction (My Contract):} \href{https://sepolia.etherscan.io/tx/[TX_HASH_HERE]}{[TX\_HASH\_HERE]}
+    \item \textbf{Commit Bid (Peer Contract):} \href{https://sepolia.etherscan.io/tx/[TX_HASH_HERE]}{[TX\_HASH\_HERE]}
+    \item \textbf{Reveal Bid (Peer Contract):} \href{https://sepolia.etherscan.io/tx/[TX_HASH_HERE]}{[TX\_HASH\_HERE]}
+    \item \textbf{Finalise (My Contract):} \href{https://sepolia.etherscan.io/tx/[TX_HASH_HERE]}{[TX\_HASH\_HERE]}
+    \item \textbf{Withdraw Funds/Claim Refund (My or Peer Contract):} \href{https://sepolia.etherscan.io/tx/[TX_HASH_HERE]}{[TX\_HASH\_HERE]}
+    % Add other relevant transactions like attempting an exploit if applicable
+\end{itemize}
+
+
+% The appendix for code is removed as requested.
+% You can add an appendix manually if needed for other content.
+% Example:
+% \newpage
+% \appendix
+% \section{Appendix: Supplementary Material}
+% (Add any other relevant material here)
+
+\end{document}
+
