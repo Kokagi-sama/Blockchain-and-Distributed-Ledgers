@@ -4,4 +4,4 @@ ClassNFT address:
 Vickrey Auction address:
 0x4aD0358126c50720caEc490a97BDF7D1aFf598C8 (old)
 
-0xd131B470caA43e18141a0B854DdC5493A89de6A5 (new)
+0xbCabCa54D6d26c19AFe4078C6e20eaFfd8B1716b (new)

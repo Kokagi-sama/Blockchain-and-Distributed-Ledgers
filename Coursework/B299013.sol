@@ -21,8 +21,8 @@ contract VickreyAuction is IERC721Receiver {
         uint256 reservePrice;           // The minimum price the seller will accept.
         uint256 biddingEndTime;         // The timestamp when the commit/bidding phase ends.
         uint256 revealEndTime;          // The timestamp when the reveal phase ends.
-        bool active;                    // The flag to check activity of the auction.
-        bool finalised;                 // The flag to check whether auction has been finalised.
+        bool isActive;                    // The flag to check activity of the auction.
+        bool isFinalised;                 // The flag to check whether auction has been finalised.
         address payable highestBidder;  // The current winning bidder.
         uint256 highestBid;             // The highest bid amount revealed so far.
         uint256 secondHighestBid;       // The second-highest bid amount revealed.
@@ -34,7 +34,7 @@ contract VickreyAuction is IERC721Receiver {
         bytes32 commitment;            // The user's hashed bid (keccak256(amount, nonce)).
         uint256 deposit;               // The total Wei the bidder locked up with their bid.
         uint256 commitBlock;           // The block number when the bid was committed.
-        bool revealed;                 // The flag to check whether bid was revealed.
+        bool isRevealed;                 // The flag to check whether bid was revealed.
     }
 
     // A counter to give each new auction a unique ID. Not using counters library since version ^0.8 prevents underflow/overflow
@@ -111,7 +111,7 @@ contract VickreyAuction is IERC721Receiver {
 
     // Creates a new auction.
     function startAuction(
-        uint256 _tokenId,          // The ID of the NFT to sell.
+        uint256 _tokenId,          // The ID of the NFT to be auctioned off.
         uint256 _reservePrice,     // The minimum price.
         uint256 _biddingDuration,  // How long the bidding phase lasts (seconds).
         uint256 _revealDuration    // How long the reveal phase lasts (seconds).
@@ -120,6 +120,12 @@ contract VickreyAuction is IERC721Receiver {
         require(nftContract.ownerOf(_tokenId) == msg.sender, "Not the NFT's owner.");
         require(_biddingDuration > 0, "Bidding duration must be more than 0.");
         require(_revealDuration > 0, "Reveal duration must be more than 0.");
+
+        // Checks that the contract is approved to take the NFT.
+        require( nftContract.getApproved(_tokenId) == address(this) 
+            || nftContract.isApprovedForAll(msg.sender, address(this)),
+            "Contract not approved for this NFT."
+        );
 
         // Transfers the NFT from the seller into this contract, which acts as a secure escrow.
         nftContract.safeTransferFrom(msg.sender, address(this), _tokenId);
@@ -133,8 +139,8 @@ contract VickreyAuction is IERC721Receiver {
         newAuction.reservePrice = _reservePrice;
         newAuction.biddingEndTime = block.timestamp + _biddingDuration;
         newAuction.revealEndTime = newAuction.biddingEndTime + _revealDuration;
-        newAuction.active = true;
-        newAuction.finalised = false;
+        newAuction.isActive = true;
+        newAuction.isFinalised = false;
 
         // Increments the counter so the next auction gets a new ID.
         auctionCounter++;
@@ -158,7 +164,7 @@ contract VickreyAuction is IERC721Receiver {
 
         // Checks to ensure the auction is in a valid state for bidding.
         require(msg.sender != auction.seller, "Seller cannot bid.");
-        require(auction.active, "Auction not active.");
+        require(auction.isActive, "Auction not active.");
         require(block.timestamp < auction.biddingEndTime, "Bidding phase over.");
 
         // Check to ensure a bidder can only commit once.
@@ -172,7 +178,7 @@ contract VickreyAuction is IERC721Receiver {
         newBid.commitment = _commitment;
         newBid.deposit = msg.value;         // msg.value is the amount of Wei sent.
         newBid.commitBlock = block.number;  // Stores the block number for tie-breaking.
-        newBid.revealed = false;
+        newBid.isRevealed = false;
 
         emit BidCommitted(_auctionId, msg.sender, newBid.commitment);
     }
@@ -187,13 +193,13 @@ contract VickreyAuction is IERC721Receiver {
         Bid storage bid = bids[_auctionId][msg.sender];
 
         // Checks to ensure the auction is in the correct reveal phase.
-        require(auction.active, "Auction not active.");
+        require(auction.isActive, "Auction not active.");
         require(block.timestamp > auction.biddingEndTime, "Bidding phase not over.");
         require(block.timestamp < auction.revealEndTime, "Reveal phase over.");
 
         // Checks that the bidder has a committed bid to reveal.
         require(bid.commitment != 0, "No bid committed");
-        require(!bid.revealed, "Bid already revealed");
+        require(!bid.isRevealed, "Bid already revealed");
 
         // Recalculate and check the hash to see if it matches the one committed earlier.
         bytes32 commitment = keccak256(abi.encodePacked(_bidAmount, _nonce));
@@ -203,7 +209,7 @@ contract VickreyAuction is IERC721Receiver {
         require(bid.deposit >= _bidAmount, "Deposit less than required amount");
 
         // Marks the bid as revealed to prevent revealing again.
-        bid.revealed = true;
+        bid.isRevealed = true;
 
         // Check if bid meet reserve price threshold.
         if(_bidAmount < auction.reservePrice){
@@ -250,13 +256,13 @@ contract VickreyAuction is IERC721Receiver {
         Auction storage auction = auctions[_auctionId];
 
         // Checks to ensure the auction can be finalised.
-        require(auction.active, "Auction not active.");
+        require(auction.isActive, "Auction not active.");
         require(block.timestamp > auction.revealEndTime, "Reveal phase not over.");
-        require(!auction.finalised, "Auction already finalised");
+        require(!auction.isFinalised, "Auction already finalised");
 
         // Marks the auction as finished so this can't be run again.
-        auction.finalised = true;
-        auction.active = false;
+        auction.isFinalised = true;
+        auction.isActive = false;
 
         address payable winner = auction.highestBidder;
         uint256 paymentAmount = 0;
@@ -307,14 +313,14 @@ contract VickreyAuction is IERC721Receiver {
         }        
     }
 
-    // Allows losing bidders to claim their deposits back.
+    // Allows losing bidders to make their deposits claimable by transferring their deposits to withdrawable balance.
     function claimLosingBid(
         uint256 _auctionId  // The auction they bid in.
     ) external {
         Auction storage auction = auctions[_auctionId];
 
         // Checks that the auction is over and the caller is not the winner.
-        require(auction.finalised, "Auction not finalised");
+        require(auction.isFinalised, "Auction not finalised");
         require(msg.sender != auction.highestBidder, "Winner cannot claim refund here");
 
         Bid storage bid = bids[_auctionId][msg.sender];
