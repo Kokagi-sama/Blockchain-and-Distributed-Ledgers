@@ -16,7 +16,7 @@ The project consists of three main components:
 - [Security Considerations](#security-considerations)
 
 ## Folder Structure
-
+```
 Coursework/
 ├── Code/
 │   ├── B299013.sol              # The main Vickrey auction smart contract
@@ -29,6 +29,7 @@ Coursework/
 ├── transactions.txt             # Transaction records
 ├── LICENSE                      # License file
 └── README.md                    # This file
+```
 
 ---
 
